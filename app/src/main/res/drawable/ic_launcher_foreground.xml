@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标：前景 —— 叉号 + 小字"跳过" -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 圆角方块背景 -->
+    <path
+        android:fillColor="#4CAF50"
+        android:pathData="M24,18 L84,18 C87.3,18 90,20.7 90,24 L90,84 C90,87.3 87.3,90 84,90 L24,90 C20.7,90 18,87.3 18,84 L18,24 C18,20.7 20.7,18 24,18 Z" />
+
+    <!-- 叉号 ✕ -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M39,36 L69,66 M69,36 L39,66"
+        android:strokeWidth="5"
+        android:strokeColor="#FFFFFF"
+        android:strokeLineCap="round" />
+
+    <!-- 广告图标简化：右下角小方块 -->
+    <path
+        android:fillColor="#81C784"
+        android:pathData="M64,62 L74,62 L74,72 L64,72 Z" />
+</vector>

@@ -1,0 +1,30 @@
+# Gradle
+.gradle/
+build/
+*.iml
+*.hprof
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Android
+local.properties
+app/build/
+app/release/
+*.apk
+*.aab
+*.keystore
+!app/*.jks
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+secrets.properties
+
+# 临时文件
+check_env.js

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">无广告</string>
+
+    <!-- 无障碍服务描述（用户开启时会看到） -->
+    <string name="accessibility_service_description">
+        无广告需要无障碍服务权限来自动检测并点击应用内的"跳过广告"按钮。
+        我们不会收集任何个人信息，所有数据仅存储在您的设备上。
+    </string>
+
+    <!-- 按钮文案 -->
+    <string name="btn_open_accessibility">前往开启无障碍服务</string>
+    <string name="btn_start_service">启动后台服务</string>
+    <string name="btn_clear">清空记录</string>
+
+    <!-- 提示文案 -->
+    <string name="hint_no_records">还没有拦截记录哦～</string>
+    <string name="hint_no_records_sub">开启服务后，肥肥会自动帮你跳过广告！</string>
+    <string name="label_total">累计拦截广告</string>
+    <string name="label_count_unit">次</string>
+</resources>

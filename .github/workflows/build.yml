@@ -1,0 +1,65 @@
+name: Build APK
+
+# 当推送到 main 分支或手动触发时构建
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - 'README.md'
+      - '.gitignore'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:  # 允许手动触发
+    inputs:
+      buildType:
+        description: '构建类型'
+        required: true
+        type: choice
+        default: 'debug'
+        options:
+          - debug
+          - release
+
+jobs:
+  build:
+    name: 编译 APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v4
+
+      - name: ☕ 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: 🛠 设置 Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: 🔨 编译 Debug APK
+        if: ${{ github.event.inputs.buildType != 'release' }}
+        run: ./gradlew assembleDebug
+
+      - name: 🔨 编译 Release APK（未签名）
+        if: ${{ github.event.inputs.buildType == 'release' }}
+        run: ./gradlew assembleRelease
+
+      - name: 📦 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NoAd-APK
+          path: app/build/outputs/apk/**/*.apk
+          retention-days: 30
+          compression-level: 6
+
+      - name: 📋 APK 信息
+        run: |
+          echo "## 🐟 构建完成！" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 文件 | 大小 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          find app/build/outputs/apk -name "*.apk" -exec sh -c 'echo "| $(basename {}) | $(du -sh {} | cut -f1) |"' \; >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ Debug APK 可直接安装，Release APK 需签名后才能安装。" >> $GITHUB_STEP_SUMMARY
