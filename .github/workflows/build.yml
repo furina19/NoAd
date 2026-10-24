@@ -37,6 +37,8 @@ jobs:
 
       - name: 🛠 设置 Gradle
         uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
 
       - name: 🔨 编译 Debug APK
         if: ${{ github.event.inputs.buildType != 'release' }}
