@@ -18,6 +18,8 @@ app/release/
 *.aab
 *.keystore
 !app/*.jks
+# 固定签名密钥需要提交到仓库，本地和 CI 共用（个人小工具，密码固定）
+!noad.keystore
 
 # OS
 .DS_Store

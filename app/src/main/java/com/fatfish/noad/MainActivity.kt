@@ -69,6 +69,39 @@ class MainActivity : AppCompatActivity() {
             startKeepAliveService()
             refreshUI()
         }
+        // 诊断日志
+        binding.btnDebugLog.setOnClickListener {
+            showDebugLogDialog()
+        }
+    }
+
+    /**
+     * 显示诊断日志对话框
+     */
+    private fun showDebugLogDialog() {
+        val log = DebugLogger.read(this)
+        val preview = if (log.length > 8000) {
+            "…(只显示最近部分)\n" + log.takeLast(8000)
+        } else {
+            log
+        }
+        AlertDialog.Builder(this)
+            .setTitle("🛠 诊断日志")
+            .setMessage(preview)
+            .setPositiveButton("关闭", null)
+            .setNeutralButton(if (DebugLogger.isEnabled(this)) "停止记录" else "开始记录") { _, _ ->
+                DebugLogger.setEnabled(this, !DebugLogger.isEnabled(this))
+                toast(if (DebugLogger.isEnabled(this)) "已开启诊断记录" else "已停止诊断记录")
+            }
+            .setNegativeButton("清空") { _, _ ->
+                DebugLogger.clear(this)
+                toast("日志已清空")
+            }
+            .show()
+    }
+
+    private fun toast(msg: String) {
+        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
     }
 
     /**

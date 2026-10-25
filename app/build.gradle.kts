@@ -1,20 +1,65 @@
+import java.io.ByteArrayOutputStream
+import java.io.File
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
 
+// ======================================================================
+// 固定签名：本地编译和 GitHub Actions 共用同一把密钥
+// ----------------------------------------------------------------------
+// 首次构建时若项目根目录没有 noad.keystore，会自动用 JDK 自带的 keytool
+// 生成一把固定参数的密钥（别名 noad / 密码 noad123）。
+// 生成后该文件会保留在项目里并提交到仓库 → 所有来源编译出的 APK
+// 签名一致，可以互相覆盖安装。
+// ======================================================================
+val noadKeystore: File = rootProject.file("noad.keystore")
+
+if (!noadKeystore.exists()) {
+    try {
+        val isWindows = System.getProperty("os.name", "")
+            .lowercase()
+            .contains("windows")
+        val keytoolInJdk = File(
+            System.getProperty("java.home"),
+            "bin/keytool" + if (isWindows) ".exe" else ""
+        )
+        val keytool = if (keytoolInJdk.exists()) keytoolInJdk.absolutePath else "keytool"
+        exec {
+            commandLine(
+                keytool,
+                "-genkeypair",
+                "-keystore", noadKeystore.absolutePath,
+                "-alias", "noad",
+                "-keyalg", "RSA",
+                "-keysize", "2048",
+                "-validity", "30000",
+                "-storepass", "noad123",
+                "-keypass", "noad123",
+                "-dname", "CN=NoAd, OU=NoAd, O=NoAd, L=Unknown, ST=Unknown, C=CN",
+                "-noprompt"
+            )
+            workingDir = rootProject.projectDir
+            standardOutput = ByteArrayOutputStream()
+            errorOutput = ByteArrayOutputStream()
+        }
+        println("✅ 已生成固定签名密钥: ${noadKeystore.absolutePath}")
+    } catch (e: Exception) {
+        println("⚠️ 自动生成签名密钥失败，将回退到系统默认 debug 签名: ${e.message}")
+    }
+}
+
+val hasFixedKeystore: Boolean = noadKeystore.exists()
+
 android {
     namespace = "com.fatfish.noad"
     compileSdk = 34
 
-    // ====== 固定签名：解决不同机器/CI 编译 APK 签名不同导致无法覆盖安装的问题 ======
-    // 如果项目根目录存在 noad.keystore，就用它签名（保证每次编译签名一致）
-    // 如果不存在（本地首次编译），回退到系统默认 debug 签名
-    val keystoreFile = rootProject.file("noad.keystore")
     signingConfigs {
         create("fixed") {
-            if (keystoreFile.exists()) {
-                storeFile = keystoreFile
+            if (hasFixedKeystore) {
+                storeFile = noadKeystore
                 storePassword = "noad123"
                 keyAlias = "noad"
                 keyPassword = "noad123"
@@ -26,8 +71,8 @@ android {
         applicationId = "com.fatfish.noad"
         minSdk = 24
         targetSdk = 34
-        versionCode = 4
-        versionName = "1.2.1"
+        versionCode = 6
+        versionName = "1.3.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -40,18 +85,14 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // 固定签名（如果 keystore 存在）
-            val fixed = signingConfigs.findByName("fixed")
-            if (fixed != null && fixed.storeFile?.exists() == true) {
-                signingConfig = fixed
+            if (hasFixedKeystore) {
+                signingConfig = signingConfigs.getByName("fixed")
             }
         }
         debug {
             isMinifyEnabled = false
-            // 固定签名（如果 keystore 存在）
-            val fixed = signingConfigs.findByName("fixed")
-            if (fixed != null && fixed.storeFile?.exists() == true) {
-                signingConfig = fixed
+            if (hasFixedKeystore) {
+                signingConfig = signingConfigs.getByName("fixed")
             }
         }
     }

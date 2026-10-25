@@ -101,19 +101,20 @@ echo.
 echo   ╔══════════════════════════════════════╗
 echo   ║  🎉 推送成功！                      ║
 echo   ║                                    ║
-echo   ║  GitHub Actions 会在大约 3 分钟后   ║
-echo   ║  自动编译出 APK 安装包！            ║
+echo   ║  🔑 签名密钥 noad.keystore 已一起  ║
+echo   ║  提交到仓库，本地和 GitHub Actions ║
+echo   ║  编译的 APK 签名完全一致！          ║
 echo   ║                                    ║
 echo   ║  📦 下载 APK：                      ║
 echo   ║  你的仓库 → Actions 标签            ║
 echo   ║  → 点最新运行 → Artifacts           ║
 echo   ║  → 下载 NoAd-APK.zip               ║
 echo   ║                                    ║
-echo   ║  ⚠️  首次安装提示：                 ║
-echo   ║  如果手机上已有桌宠鱼装的旧版本，   ║
-echo   ║  需先卸载旧版再装这个新版！         ║
-echo   ║  之后每次从 GitHub 更新就能直接     ║
-echo   ║  覆盖安装啦～                       ║
+echo   ║  ⚠️  最后一次卸载：                 ║
+echo   ║  旧版本用的是已丢失的临时密钥，     ║
+echo   ║  所以手机上旧版再卸载一次即可。     ║
+echo   ║  装上 v1.3.1 之后，所有来源的构建  ║
+echo   ║  都能直接覆盖安装，不用再卸载啦～   ║
 echo   ║                                    ║
 echo   ║  🐟 肥肥的尾巴摇成螺旋桨啦！       ║
 echo   ╚══════════════════════════════════════╝

@@ -2,22 +2,25 @@ package com.fatfish.noad
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.accessibilityservice.GestureDescription
 import android.app.NotificationManager
+import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import java.util.Collections
+import java.util.IdentityHashMap
 
 /**
- * 广告跳过无障碍服务 v1.2
+ * 广告跳过无障碍服务 v1.3
  *
- * v1.2 修复：
- *   1. "1S | 跳过"（数字在前）识别 → 支持倒计时前置/后置两种格式
- *   2. 多广告页面误点广告主体 → 评分制 + 尺寸/位置硬约束 + 广告标签黑名单
- *   3. 视频广告跳过按钮延迟出现 → 事件后追加延迟重试扫描
- *   4. 信息流广告的 "×" 关闭按钮 → 支持 × / ✕ 符号识别
+ * v1.3 重大修复（针对真实广告截图）：
+ *   1. 跳过按钮文字节点不可点击 → 向上找可点击父容器（最多3层）
+ *   2. WebView/自定义 View 广告点击无效 → dispatchGesture 坐标点击兜底
+ *   3. 拒绝点广告主体的同时，允许对"小按钮坐标"精准手势点击
  *
  * 核心设计：先收集所有候选节点 → 评分 → 排序 → 只点分数最高且最"像跳过按钮"的那个
  */
@@ -90,6 +93,12 @@ class AdSkipService : AccessibilityService() {
             "第三方应用", "立即体验", "立即查看",
         )
 
+        // 正常功能按钮排除词（不是广告，不点）
+        private val SKIP_EXCLUDE_WORDS = listOf(
+            "跳过教程", "跳過教程", "跳过引导", "跳过介绍", "跳过新手",
+            "跳过设置", "跳过此步", "跳过验证",
+        )
+
         // ============ 倒计时正则（视频/开屏广告） ============
         // 格式1："跳过 5s" / "跳过3" / "skip 5 seconds"
         private val RE_COUNTDOWN_AFTER = Regex(
@@ -110,7 +119,7 @@ class AdSkipService : AccessibilityService() {
         // ============ 运行参数 ============
         private const val SCAN_THROTTLE_MS = 350L      // 两次扫描最小间隔
         private const val MIN_SCORE_TO_CLICK = 70      // 点击阈值（分数制满分100）
-        private const val MAX_SAME_PKG_SKIP = 3        // 同包名连续跳过上限
+        private const val MAX_SAME_PKG_SKIP = 5        // 同包名连续跳过上限（一次页面可能多个广告）
         private const val SAME_PKG_WINDOW_MS = 10_000L // 同包名限流窗口
         private const val MAX_NODES = 600              // 单次遍历节点上限
         private const val MAX_DEPTH = 26               // 遍历深度上限
@@ -204,6 +213,25 @@ class AdSkipService : AccessibilityService() {
         }
 
         val candidates = collectCandidates(root)
+
+        if (DebugLogger.isEnabled(this)) {
+            DebugLogger.log(this, "扫描 $pkg → 候选 ${candidates.size} 个")
+            candidates.sortedWith(
+                compareByDescending<Candidate> { it.score }.thenBy { it.area }
+            ).take(5).forEach { c ->
+                val r = Rect()
+                c.node.getBoundsInScreen(r)
+                DebugLogger.log(
+                    this,
+                    "  候选 score=${c.score} gesture=${c.gestureOnly} " +
+                    "bounds=${r.width()}x${r.height()} label=${labelOf(c.node)}"
+                )
+            }
+            if (candidates.isEmpty()) {
+                dumpKeywordNodes(root, pkg)
+            }
+        }
+
         root.recycle()
 
         if (candidates.isEmpty()) return
@@ -214,16 +242,75 @@ class AdSkipService : AccessibilityService() {
         )
 
         val best = sortedCandidates.first()
-        if (performClick(best.node, pkg)) {
+        if (performClick(best, pkg)) {
             lastSkipTime = System.currentTimeMillis()
             if (pkg == lastSkippedPkg) samePkgSkipCount++ else {
                 samePkgSkipCount = 1
                 lastSkippedPkg = pkg
             }
+            DebugLogger.log(this, "✅ 点击成功 $pkg label=${labelOf(best.node)}")
+        } else {
+            DebugLogger.log(this, "❌ 点击失败 $pkg label=${labelOf(best.node)}")
         }
 
         // 回收所有候选节点
         for (c in candidates) c.node.recycle()
+    }
+
+    /**
+     * 取节点文本（调试用）
+     */
+    private fun labelOf(node: AccessibilityNodeInfo): String {
+        return try {
+            val t = node.text?.toString()?.trim().orEmpty()
+            val d = node.contentDescription?.toString()?.trim().orEmpty()
+            (if (t.isNotEmpty()) t else d).replace("\n", " ")
+        } catch (_: Exception) {
+            "?"
+        }
+    }
+
+    /**
+     * 调试用：dump 页面里含"跳/关/广告/×"等关键词的节点
+     * 用于诊断"为什么这个广告没被识别"
+     */
+    private fun dumpKeywordNodes(root: AccessibilityNodeInfo, pkg: String) {
+        val keywords = listOf("跳", "关", "关", "×", "x", "X", "广告", "ad", "skip", "close")
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.addLast(root)
+        var visited = 0
+        var dumped = 0
+        DebugLogger.log(this, "  未找到候选，页面关键词节点：")
+
+        while (stack.isNotEmpty() && visited < MAX_NODES && dumped < 15) {
+            val node = stack.removeLast()
+            visited++
+            try {
+                val label = labelOf(node)
+                if (label.length in 1..30) {
+                    for (k in keywords) {
+                        if (label.contains(k, ignoreCase = true)) {
+                            val r = Rect()
+                            node.getBoundsInScreen(r)
+                            DebugLogger.log(
+                                this,
+                                "    「$label」clickable=${node.isClickable} " +
+                                "visible=${node.isVisibleToUser} " +
+                                "bounds=${r.width()}x${r.height()} " +
+                                "class=${node.className?.toString()?.substringAfterLast('.')}"
+                            )
+                            dumped++
+                            break
+                        }
+                    }
+                }
+                for (i in 0 until node.childCount) {
+                    val child = node.getChild(i) ?: continue
+                    stack.addLast(child)
+                }
+            } catch (_: Exception) {
+            }
+        }
     }
 
     // ========================================================================
@@ -232,9 +319,14 @@ class AdSkipService : AccessibilityService() {
 
     /**
      * 广度遍历整棵节点树，收集所有疑似跳过按钮
+     * 关键：文本节点本身不可点击时，向上找可点击父容器或降级为坐标点击
      */
     private fun collectCandidates(root: AccessibilityNodeInfo): List<Candidate> {
         val result = ArrayList<Candidate>()
+        // 按点击目标身份去重（多个文字节点可能指向同一个父容器）
+        val seenTargets = Collections.newSetFromMap(
+            IdentityHashMap<AccessibilityNodeInfo, Boolean>()
+        )
         val stack = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
         stack.addLast(root to 0)
         var visited = 0
@@ -245,13 +337,9 @@ class AdSkipService : AccessibilityService() {
 
             try {
                 if (depth <= MAX_DEPTH) {
-                    val score = evaluate(node)
-                    if (score >= MIN_SCORE_TO_CLICK) {
-                        val rect = Rect()
-                        node.getBoundsInScreen(rect)
-                        result.add(
-                            Candidate(node, score, rect.width() * rect.height())
-                        )
+                    val candidate = evaluateNode(node)
+                    if (candidate != null && seenTargets.add(candidate.node)) {
+                        result.add(candidate)
                     }
                 }
 
@@ -268,21 +356,87 @@ class AdSkipService : AccessibilityService() {
         return result
     }
 
+    /**
+     * 评估节点并给出点击计划
+     *
+     * 广告跳过按钮的真实结构往往是：
+     *   FrameLayout(可点击) > 背景图 + TextView("跳过 4")(不可点击)
+     * 或 WebView 里 JS 绑定的 div（无障碍认为不可点击）
+     * 所以：文本匹配后用「可点击祖先」或「坐标手势」来真正点下去
+     */
+    private fun evaluateNode(node: AccessibilityNodeInfo): Candidate? {
+        // 1. 文本/位置评分（用节点自身 bounds 做尺寸检查）
+        val score = scoreNode(node)
+        if (score < MIN_SCORE_TO_CLICK) return null
+
+        // 2. 确定点击目标
+        var clickNode = node
+        var gestureOnly = false
+
+        if (!node.isClickable) {
+            val ancestor = findClickableAncestor(node, 3)
+            if (ancestor != null) {
+                val aRect = Rect()
+                ancestor.getBoundsInScreen(aRect)
+                val density = resources.displayMetrics.density
+                val aW = aRect.width() / density
+                val aH = aRect.height() / density
+                // 祖先尺寸合理（就是按钮大小）→ 直接点祖先
+                if (aW in MIN_WIDTH_DP..MAX_WIDTH_DP && aH in MIN_HEIGHT_DP..MAX_HEIGHT_DP) {
+                    clickNode = ancestor
+                } else {
+                    // 祖先太大（整个广告卡片）→ 不点大卡片，改为对文字节点坐标做手势点击
+                    gestureOnly = true
+                }
+            } else {
+                // 没有可点击祖先 → 坐标手势点击
+                gestureOnly = true
+            }
+        }
+
+        val rect = Rect()
+        clickNode.getBoundsInScreen(rect)
+        if (rect.width() <= 0 || rect.height() <= 0) return null
+
+        return Candidate(
+            node = clickNode,
+            score = score,
+            area = rect.width() * rect.height(),
+            gestureOnly = gestureOnly
+        )
+    }
+
+    /**
+     * 向上找最近的可点击祖先
+     */
+    private fun findClickableAncestor(
+        node: AccessibilityNodeInfo,
+        maxDepth: Int
+    ): AccessibilityNodeInfo? {
+        var current = node.parent
+        var depth = 0
+        while (current != null && depth < maxDepth) {
+            if (current.isClickable) return current
+            current = current.parent
+            depth++
+        }
+        return null
+    }
+
     // ========================================================================
     // 节点评分（核心）
     // ========================================================================
 
     /**
-     * 给一个节点打分：
+     * 给一个节点打分（只看文本和尺寸，不要求节点可点击）：
      *   100 = 强关键词精确匹配 / 倒计时格式
      *   85  = × 符号 + 小尺寸
      *   80  = 弱关键词 + 广告上下文
-     *   70  = 弱关键词 + 屏幕角落
+     *   70  = 弱关键词 + 屏幕边缘位置
      *   0   = 不是跳过按钮
      */
-    private fun evaluate(node: AccessibilityNodeInfo): Int {
+    private fun scoreNode(node: AccessibilityNodeInfo): Int {
         if (!node.isVisibleToUser) return 0
-        if (!node.isClickable) return 0
 
         val rect = Rect()
         node.getBoundsInScreen(rect)
@@ -326,6 +480,10 @@ class AdSkipService : AccessibilityService() {
         for (promo in PROMO_WORDS) {
             if (label.contains(promo, ignoreCase = true)) return 0
         }
+        // ====== 正常功能按钮（跳过教程等）排除 ======
+        for (exclude in SKIP_EXCLUDE_WORDS) {
+            if (label.contains(exclude, ignoreCase = true)) return 0
+        }
 
         // ====== 1. 强关键词 ======
         for (k in STRONG_KEYWORDS) {
@@ -350,8 +508,8 @@ class AdSkipService : AccessibilityService() {
             if (wDp > 120 || hDp > 120) return 0
             // 有广告上下文 → 高置信度
             if (hasAdContext(node)) return 85
-            // 无上下文但在屏幕角落 → 悬浮广告/卡片 × 常见位置，中等置信度
-            if (isCorner(rect)) return 75
+            // 位于屏幕边缘/角落 → 悬浮广告/卡片 × 常见位置
+            if (isEdgeClosePosition(rect)) return 75
             return 0
         }
 
@@ -369,7 +527,7 @@ class AdSkipService : AccessibilityService() {
             if (wDp > 120 || hDp > 100) return 0
             if (hasAdContext(node)) return 80
             if (isCorner(rect)) return 72
-            return 0  // 不在角落 + 无广告上下文 → 不点（防误关下载/通知）
+            return 0  // 不在顶部角落 + 无广告上下文 → 不点（防误关下载/通知）
         }
 
         // ====== 4. 弱关键词（跳过/skip）需上下文 ======
@@ -380,7 +538,7 @@ class AdSkipService : AccessibilityService() {
         }
         if (matchedWeak) {
             if (hasAdContext(node)) return 85
-            if (isCorner(rect)) return 70
+            if (isEdgeClosePosition(rect)) return 70
             return 0 // 无佐证 → 不点
         }
 
@@ -453,6 +611,32 @@ class AdSkipService : AccessibilityService() {
         return inTopBand && (inLeftHalf || inRightHalf)
     }
 
+    /**
+     * 是否位于「关闭按钮常见位置」：
+     *   1. 顶部左右角落（开屏广告的跳过按钮）
+     *   2. 屏幕左右边缘、上 70% 区域（信息流广告卡片的 × 可能在页面中部）
+     * 排除底部 20% 区域，避免误点浏览器下载进度条的关闭按钮
+     */
+    private fun isEdgeClosePosition(rect: Rect): Boolean {
+        val dm = resources.displayMetrics
+        val w = dm.widthPixels
+        val h = dm.heightPixels
+
+        // 顶部角落
+        if (isCorner(rect)) return true
+
+        // 底部 20% 区域排除（下载通知/底部导航按钮）
+        if (rect.top > h * 0.8f) return false
+
+        // 右侧边缘（上 70% 区域）：信息流广告卡片 ×
+        if (rect.left > w * 0.65f && rect.top < h * 0.7f) return true
+
+        // 左侧边缘（上 70% 区域）
+        if (rect.right < w * 0.35f && rect.top < h * 0.7f) return true
+
+        return false
+    }
+
     private fun isSystemPackage(pkg: String): Boolean {
         if (pkg in SYSTEM_PACKAGES_EXACT) return true
         for (prefix in SYSTEM_PACKAGES_PREFIX) {
@@ -465,17 +649,57 @@ class AdSkipService : AccessibilityService() {
     // 点击 & 通知
     // ========================================================================
 
-    private fun performClick(node: AccessibilityNodeInfo, pkg: String): Boolean {
-        val clicked = try {
-            node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        } catch (_: Exception) {
-            false
+    /**
+     * 执行点击：先试无障碍 ACTION_CLICK，失败则用坐标手势点击
+     * （WebView 广告、自定义 View 的点击事件往往不响应 ACTION_CLICK）
+     */
+    private fun performClick(candidate: Candidate, pkg: String): Boolean {
+        var clicked = false
+
+        // 1. 优先无障碍点击（gestureOnly=false 时）
+        if (!candidate.gestureOnly) {
+            clicked = try {
+                candidate.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            } catch (_: Exception) {
+                false
+            }
         }
+
+        // 2. 兜底：坐标手势点击
+        if (!clicked) {
+            val rect = Rect()
+            try {
+                candidate.node.getBoundsInScreen(rect)
+            } catch (_: Exception) {
+                return false
+            }
+            if (rect.width() > 0 && rect.height() > 0) {
+                clicked = clickByGesture(rect.exactCenterX(), rect.exactCenterY())
+            }
+        }
+
         if (clicked) {
             AdStatsManager.recordSkip(this, pkg)
             showSkipNotification(pkg)
         }
         return clicked
+    }
+
+    /**
+     * 通过无障碍手势在指定坐标点击
+     */
+    private fun clickByGesture(x: Float, y: Float): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return false
+        return try {
+            val path = Path()
+            path.moveTo(x, y)
+            val gesture = GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path, 0, 50))
+                .build()
+            dispatchGesture(gesture, null, null)
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun showSkipNotification(pkg: String) {
@@ -525,6 +749,8 @@ class AdSkipService : AccessibilityService() {
     private data class Candidate(
         val node: AccessibilityNodeInfo,
         val score: Int,
-        val area: Int
+        val area: Int,
+        /** true = 直接坐标手势点击（节点不可点击且祖先太大/不存在） */
+        val gestureOnly: Boolean = false
     )
 }

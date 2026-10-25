@@ -228,6 +228,16 @@
                             android:textStyle="bold" />
 
                         <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnDebugLog"
+                            style="@style/Widget.Material3.Button.TextButton"
+                            android:layout_width="wrap_content"
+                            android:layout_height="32dp"
+                            android:text="诊断日志"
+                            android:textColor="@color/text_secondary"
+                            android:textSize="12sp"
+                            app:cornerRadius="16dp" />
+
+                        <com.google.android.material.button.MaterialButton
                             android:id="@+id/btnClearStats"
                             style="@style/Widget.Material3.Button.TextButton"
                             android:layout_width="wrap_content"
