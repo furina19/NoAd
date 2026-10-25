@@ -283,11 +283,10 @@ class AdSkipService : AccessibilityService() {
         }
 
         // 排序：优先级从高到低，同优先级的从右上到左下
-        candidates.sortWith(
-            compareByDescending<Candidate> { it.priority }
-                .thenBy { it.rect.top }
-                .thenByDescending { it.rect.right }
-        )
+        // 稳定排序倒序 apply：先 least significant，最后 most significant
+        candidates.sortByDescending { it.rect.right }    // least: right ↓
+        candidates.sortBy { it.rect.top }                 // mid:   top ↑
+        candidates.sortByDescending { it.priority }       // most:  priority ↓
 
         var closedCount = 0
         val closedRects = mutableListOf<Rect>()
@@ -297,11 +296,15 @@ class AdSkipService : AccessibilityService() {
             if (isInCooldown(pkg)) break
 
             // 去重：中心点落入已关闭区域则跳过
-            val cx = candidate.rect.exactCenterX()
-            val cy = candidate.rect.exactCenterY()
-            if (closedRects.any { cr ->
-                    cx in cr.left..cr.right && cy in cr.top..cr.bottom
-                }) continue
+            val cx = candidate.rect.exactCenterX().toInt()
+            val cy = candidate.rect.exactCenterY().toInt()
+            var dup = false
+            for (cr: Rect in closedRects) {
+                if (cx >= cr.left && cx <= cr.right && cy >= cr.top && cy <= cr.bottom) {
+                    dup = true; break
+                }
+            }
+            if (dup) continue
 
             // ---- 第 4 条：重新取根节点，绝不复用旧节点/旧坐标 ----
             val freshRoot = try { rootInActiveWindow } catch (_: Exception) { null } ?: break
@@ -357,7 +360,7 @@ class AdSkipService : AccessibilityService() {
     /**
      * 收集所有关闭候选（DFS 遍历整棵节点树）
      */
-    private fun collectCandidates(root: AccessibilityNodeInfo): List<Candidate> {
+    private fun collectCandidates(root: AccessibilityNodeInfo): MutableList<Candidate> {
         val result = mutableListOf<Candidate>()
         val density = resources.displayMetrics.density
         val stack = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
