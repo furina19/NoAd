@@ -208,11 +208,11 @@ class AdSkipService : AccessibilityService() {
         if (candidates.isEmpty()) return
 
         // 排序：分数高优先，同分取面积小的（跳过按钮通常更小巧）
-        candidates.sortWith(
+        val sortedCandidates = candidates.sortedWith(
             compareByDescending<Candidate> { it.score }.thenBy { it.area }
         )
 
-        val best = candidates.first()
+        val best = sortedCandidates.first()
         if (performClick(best.node, pkg)) {
             lastSkipTime = System.currentTimeMillis()
             if (pkg == lastSkippedPkg) samePkgSkipCount++ else {
