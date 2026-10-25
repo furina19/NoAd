@@ -11,45 +11,56 @@ import android.os.Handler
 import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import java.util.Collections
-import java.util.IdentityHashMap
 
 /**
- * 广告跳过无障碍服务 v1.3.3
+ * 广告跳过无障碍服务 v1.4
  *
- * v1.3.3 修复（主人实机反馈）：
- *   1. 一页多条广告跳过无效 → 单次扫描改为点击多个候选（去重+上限3）
- *   2. 运动/时间校园类 App 时灵时不灵 → hasAdContext 搜3层祖先 + 扩充上下文词库
- *   3. 误点跳转到别的页面 → 阈值 70→75 + 修复 isBottomArea 永真逻辑bug
- *
- * v1.3 重大修复（针对真实广告截图）：
- *   1. 跳过按钮文字节点不可点击 → 向上找可点击父容器（最多3层）
- *   2. WebView/自定义 View 广告点击无效 → dispatchGesture 坐标点击兜底
- *   3. 拒绝点广告主体的同时，允许对"小按钮坐标"精准手势点击
- *
- * 核心设计：先收集所有候选节点 → 评分 → 排序 → 点多个高分的（去重+上限3）
+ * v1.4 重写——架构从「评分文字制」切换为「返回键优先 + 认控件 + 防连环」：
+ *   1. 全屏/插屏广告 → performGlobalAction(GLOBAL_ACTION_BACK)，不找 ×
+ *   2. 认控件不认字：包名 + viewId 优先，文字只做最后兜底
+ *   3. 防连环：同包名 2s 内 3 次关闭 → 全局静默 3s
+ *   4. 防误点：每次点击前重取 rootInActiveWindow + 危险文字拉黑
+ *   5. 一页多广告：从右上到左下排序，关一个就重扫再关下一个
  */
 class AdSkipService : AccessibilityService() {
 
     companion object {
+        // ============ 广告 SDK 包名特征 ============
+        private val AD_SDK_PACKAGES = listOf(
+            "com.bytedance.sdk",       // Pangle / ByteDance
+            "com.bykv.vk",             // ByteDance Volcano
+            "com.byted.pangle",        // Pangle alt
+            "com.qq.e",                // Tencent GDT 优量汇
+            "com.kwad",               // Kuaishou 快手
+            "com.kuaishou",           // Kuaishou alt
+            "com.baidu.mobads",        // Baidu
+            "com.ss.android",          // 穿山甲 / Toutiao
+            "com.sigmob",              // Sigmob
+            "com.taobao.ad",           // Alibaba
+        )
+
+        // ============ 关闭按钮 viewId 特征 ============
+        private val CLOSE_VIEW_ID_PATTERNS = listOf(
+            "close", "btn_close", "img_close", "iv_close",
+            "tt_splash_skip", "tt_dislike", "tt_close",
+            "tt_ad_close", "tt_skip_btn",
+            "dislike", "ad_close", "iv_skip", "skip_btn",
+            "close_btn", "btn_skip",
+        )
+
         // ============ 系统包名黑名单（绝对不碰） ============
         private val SYSTEM_PACKAGES_EXACT = setOf(
-            "com.android.systemui",              // 状态栏 / 通知栏 / 快捷开关
-            "com.android.settings",              // 系统设置
-            "com.android.launcher",
-            "com.android.launcher3",
-            "com.android.dialer",
-            "com.android.phone",
-            "com.android.contacts",
-            "com.android.mms",
-            "com.android.documentsui",
-            "com.android.keyguard",
+            "com.android.systemui",
+            "com.android.settings",
+            "com.android.launcher", "com.android.launcher3",
+            "com.android.dialer", "com.android.phone",
+            "com.android.contacts", "com.android.mms",
+            "com.android.documentsui", "com.android.keyguard",
             "com.android.incallui",
             "com.google.android.apps.nexuslauncher",
             "com.google.android.googlequicksearchbox",
             "com.google.android.permissioncontroller",
-            "com.google.android.deskclock",
-            "com.android.deskclock",
+            "com.google.android.deskclock", "com.android.deskclock",
             "com.android.providers.downloads",
             "com.android.providers.downloads.ui",
         )
@@ -59,93 +70,59 @@ class AdSkipService : AccessibilityService() {
             "com.bbk.", "com.oplus.",
         )
 
-        // ============ 关键词分组 ============
-        // 强关键词：精确出现即 100% 确认是广告跳过
-        private val STRONG_KEYWORDS = listOf(
+        // ============ 危险文字（绝不点击 + 连带祖先拉黑） ============
+        private val DANGEROUS_TEXTS = listOf(
+            "下载", "安装", "查看详情", "领取", "立即打开",
+            "立即下载", "免费领取", "立即领取", "点击进入",
+            "立即购买", "立即体验", "立即查看", "点击下载",
+            "惊喜", "优惠", "红包", "秒杀", "限量",
+        )
+
+        // ============ 文字兜底匹配（优先级最低） ============
+        private val SKIP_TEXTS = listOf(
             "跳过广告", "跳過廣告", "关闭广告", "關閉廣告",
-            "skip ad", "close ad", "skip ads", "close ads",
-            "关闭此广告", "不感兴趣",
+            "skip ad", "close ad", "关闭此广告",
+            "跳过", "跳過", "skip", "关闭", "close",
         )
+        private val CLOSE_SYMBOLS = setOf("×", "✕", "╳", "✖", "❌", "✗")
 
-        // 弱关键词：需要广告上下文或位置佐证
-        private val WEAK_KEYWORDS = listOf("跳过", "跳過", "skip")
-
-        // 弹窗广告常见按钮
-        private val DIALOG_KEYWORDS = listOf(
-            "我知道了", "不再提醒", "朕知道了", "知道啦", "我知道了哦",
-        )
-
-        // 关闭符号（信息流广告卡片角落的 ×）
-        private val CLOSE_SYMBOLS = setOf(
-            "×", "✕", "╳", "✖", "❌", "✗",
-        )
-
-        // 广告标签（绝不能点！点它 = 跳转广告落地页）
-        private val AD_LABELS = setOf(
-            "广告", "廣告", "AD", "Ad", "ad", "赞助", "推广", "推广内容",
-        )
-
-        // 广告上下文词（用于佐证弱关键词）
-        private val AD_CONTEXT_WORDS = listOf(
-            "广告", "廣告", "推广", "sponsored", "ad",
-            "悬浮", "悬浮球", "浮窗",  // 悬浮广告条特征（运动校园等 App 常见）
-            "第三方", "为您推荐", "猜你喜欢",  // 信息流广告常见中文文案
-            "联盟", "穿山甲",  // 广告 SDK 标识（常见于运动/校园类 App）
-        )
-
-        // 促销文案特征词（大段文案 = 广告主体，不点）
-        private val PROMO_WORDS = listOf(
-            "立即下载", "免费领取", "立即领取", "点击进入", "立即购买",
-            "惊喜", "优惠", "红包", "秒杀", "限量", "点击到落地页",
-            "第三方应用", "立即体验", "立即查看",
-        )
-
-        // 正常功能按钮排除词（不是广告，不点）
+        // ============ 排除词（不是广告跳过按钮的功能按钮） ============
         private val SKIP_EXCLUDE_WORDS = listOf(
-            "跳过教程", "跳過教程", "跳过引导", "跳过介绍", "跳过新手",
-            "跳过设置", "跳过此步", "跳过验证",
-        )
-
-        // ============ 倒计时正则（视频/开屏广告） ============
-        // 格式1："跳过 5s" / "跳过3" / "skip 5 seconds"
-        private val RE_COUNTDOWN_AFTER = Regex(
-            """^\s*(跳过|跳過|skip)\s*\d+(?:\.\d+)?\s*(?:[sS秒]|seconds?)?\s*$""",
-            RegexOption.IGNORE_CASE
-        )
-        // 格式2："1S | 跳过" / "5s 跳过" / "3|跳過"（数字在前！主人截图中的关键格式）
-        private val RE_COUNTDOWN_BEFORE = Regex(
-            """^\s*\d+(?:\.\d+)?\s*(?:[sS秒])?\s*(?:[|｜/·:：\-—]\s*)?(跳过|跳過|skip)\s*$""",
-            RegexOption.IGNORE_CASE
-        )
-        // 宽松包含式：文本里同时有倒计时和跳过
-        private val RE_COUNTDOWN_LOOSE = Regex(
-            """(跳过|跳過|skip).{0,10}\d+\s*[sS秒]|\d+\s*[sS秒].{0,10}(跳过|跳過|skip)""",
-            RegexOption.IGNORE_CASE
+            "跳过教程", "跳過教程", "跳过引导", "跳过介绍",
+            "跳过新手", "跳过设置", "跳过此步", "跳过验证",
         )
 
         // ============ 运行参数 ============
-        private const val SCAN_THROTTLE_MS = 350L      // 两次扫描最小间隔
-        private const val MIN_SCORE_TO_CLICK = 75      // 点击阈值（分数制满分100）
-        private const val MAX_SAME_PKG_SKIP = 5        // 同包名连续跳过上限（一次页面可能多个广告）
-        private const val MAX_CLICKS_PER_SCAN = 3      // 单次扫描最多点击候选数（一页多条广告）
-        private const val SAME_PKG_WINDOW_MS = 10_000L // 同包名限流窗口
-        private const val MAX_NODES = 600              // 单次遍历节点上限
-        private const val MAX_DEPTH = 26               // 遍历深度上限
+        private const val SCAN_THROTTLE_MS = 350L
+        private const val MAX_NODES = 600
+        private const val MAX_DEPTH = 26
+        private const val MAX_CLICKS_PER_SCAN = 4
+
+        // 防连环参数
+        private const val CHAIN_WINDOW_MS = 2_000L
+        private const val CHAIN_THRESHOLD = 3
+        private const val COOLDOWN_MS = 3_000L
+
+        // 尺寸硬约束
         private const val MIN_WIDTH_DP = 20f
         private const val MAX_WIDTH_DP = 360f
         private const val MIN_HEIGHT_DP = 18f
         private const val MAX_HEIGHT_DP = 160f
+
+        // 优先级常量
+        private const val PRIORITY_PKG_VIEWID = 1000   // 包名 + viewId 双命中
+        private const val PRIORITY_PKG = 800           // 仅包名命中
+        private const val PRIORITY_VIEWID = 600        // 仅 viewId 命中
+        private const val PRIORITY_TEXT = 300          // 文字兜底
     }
 
     // ============ 运行时状态 ============
     private val handler = Handler(Looper.getMainLooper())
     private var lastScanTime = 0L
-    private var lastSkipTime = 0L
-    private var samePkgSkipCount = 0
-    private var lastSkippedPkg = ""
     private var lastEventPkg = ""
-    /** 当前页面底部是否有"广告"披露标签（决定能否点底部 ×） */
-    private var bottomAdDisclosure = false
+    // 防连环：每包名的动作时间戳
+    private val pkgActionTimestamps = mutableMapOf<String, MutableList<Long>>()
+    private var globalCooldownUntil = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -168,19 +145,15 @@ class AdSkipService : AccessibilityService() {
         if (event == null) return
         val pkg = event.packageName?.toString() ?: return
 
-        // 排除自己
         if (pkg == packageName) return
-        // 排除系统应用（状态栏/设置/下载管理器等）
         if (isSystemPackage(pkg)) return
 
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                // 节流
                 val now = System.currentTimeMillis()
                 if (now - lastScanTime < SCAN_THROTTLE_MS) return
                 lastScanTime = now
-
                 lastEventPkg = pkg
                 scheduleScans(pkg)
             }
@@ -188,194 +161,205 @@ class AdSkipService : AccessibilityService() {
     }
 
     /**
-     * 扫描调度：立即扫一次，再延迟补扫几次
-     * （视频广告的跳过按钮经常在 1~3 秒后才出现）
+     * 扫描调度：立即 + 延迟补扫（视频广告跳过按钮常延迟出现）
      */
     private fun scheduleScans(pkg: String) {
         handler.removeCallbacksAndMessages(null)
-        scanAndClick(pkg)
+        processWindow(pkg)
         for (delay in longArrayOf(700L, 1800L, 3200L)) {
             handler.postDelayed({
-                if (lastEventPkg == pkg) scanAndClick(pkg)
+                if (lastEventPkg == pkg) processWindow(pkg)
             }, delay)
         }
     }
 
     // ========================================================================
-    // 扫描主流程
+    // 主流程
     // ========================================================================
 
-    private fun scanAndClick(pkg: String) {
-        // 同包名限流（防止反复点击死循环）
-        if (pkg == lastSkippedPkg) {
-            if (System.currentTimeMillis() - lastSkipTime > SAME_PKG_WINDOW_MS) {
-                samePkgSkipCount = 0
-            }
-            if (samePkgSkipCount >= MAX_SAME_PKG_SKIP) return
-        }
+    private fun processWindow(pkg: String) {
+        if (isInCooldown(pkg)) return
 
         val root = rootInActiveWindow ?: return
-        // 确认窗口还是这个应用（防止用户已切换 App / 回到桌面后误点）
         val activePkg = root.packageName?.toString()
         if (activePkg != null && activePkg != pkg) {
             root.recycle()
             return
         }
 
-        // 先探测页面底部是否有广告披露标签（"广告"小字），
-        // 有才允许点击底部区域的 ×（避免误关浏览器下载进度）
-        detectBottomAdDisclosure(root)
+        // ---- 第 1 条：全屏/插屏广告 → 返回键优先 ----
+        if (isAdSdkWindow(root)) {
+            root.recycle()
+            if (performBack(pkg)) return
+            // 返回键无效，重新取根走控件识别兜底
+            val root2 = rootInActiveWindow ?: return
+            processCandidates(root2, pkg)
+            return
+        }
 
+        // ---- 第 2~5 条：控件识别 → 排序 → 逐个关闭 ----
+        processCandidates(root, pkg)
+    }
+
+    /**
+     * 判断是否为广告 SDK 独占窗口（全屏/插屏广告）
+     * 条件：根包名来自广告 SDK，或节点树中 >30% 节点来自广告 SDK
+     */
+    private fun isAdSdkWindow(root: AccessibilityNodeInfo): Boolean {
+        val rootPkg = root.packageName?.toString() ?: return false
+        for (adPkg in AD_SDK_PACKAGES) {
+            if (rootPkg.startsWith(adPkg)) return true
+        }
+        // 抽样子节点：检查广告 SDK 节点占比
+        var total = 0
+        var adNodes = 0
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.addLast(root)
+        while (stack.isNotEmpty() && total < 80) {
+            val node = stack.removeLast()
+            total++
+            val pkg = node.packageName?.toString() ?: ""
+            for (adPkg in AD_SDK_PACKAGES) {
+                if (pkg.startsWith(adPkg)) { adNodes++; break }
+            }
+            for (i in 0 until minOf(node.childCount, 4)) {
+                node.getChild(i)?.let { stack.addLast(it) }
+            }
+        }
+        return total > 0 && adNodes.toFloat() / total > 0.3f
+    }
+
+    /**
+     * 执行全局返回键关闭全屏/插屏广告
+     */
+    private fun performBack(pkg: String): Boolean {
+        return try {
+            val ok = performGlobalAction(GLOBAL_ACTION_BACK)
+            if (ok) {
+                recordAction(pkg)
+                AdStatsManager.recordSkip(this, pkg)
+                showSkipNotification(pkg, "返回键")
+                DebugLogger.log(this, "⬅ 返回键关闭 $pkg")
+            }
+            ok
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    // ========================================================================
+    // 候选收集 & 点击（第 2~5 条）
+    // ========================================================================
+
+    /**
+     * 收集候选 → 按优先级 + 右上到左下排序 → 关一个重扫一个
+     */
+    private fun processCandidates(root: AccessibilityNodeInfo, pkg: String) {
         val candidates = collectCandidates(root)
+        root.recycle()
 
         if (DebugLogger.isEnabled(this)) {
             DebugLogger.log(this, "扫描 $pkg → 候选 ${candidates.size} 个")
-            candidates.sortedWith(
-                compareByDescending<Candidate> { it.score }.thenBy { it.area }
-            ).take(5).forEach { c ->
-                val r = Rect()
-                c.node.getBoundsInScreen(r)
-                DebugLogger.log(
-                    this,
-                    "  候选 score=${c.score} gesture=${c.gestureOnly} " +
-                    "bounds=${r.width()}x${r.height()} label=${labelOf(c.node)}"
-                )
+            candidates.take(5).forEach { c ->
+                DebugLogger.log(this,
+                    "  候选 pri=${c.priority} " +
+                    "rect=${c.rect.width()}x${c.rect.height()} " +
+                    "pos=(${c.rect.left},${c.rect.top}) " +
+                    "label=${labelOf(c.clickNode)}")
             }
             if (candidates.isEmpty()) {
-                dumpKeywordNodes(root, pkg)
+                val root2 = rootInActiveWindow ?: return
+                dumpKeywordNodes(root2, pkg)
+                root2.recycle()
+                // 回收候选以防泄漏（空集时不会进入循环）
+                candidates.forEach { try { it.clickNode.recycle() } catch (_: Exception) {} }
+                return
             }
         }
 
-        root.recycle()
+        if (candidates.isEmpty()) {
+            candidates.forEach { try { it.clickNode.recycle() } catch (_: Exception) {} }
+            return
+        }
 
-        if (candidates.isEmpty()) return
-
-        // 排序：分数高优先，同分取面积小的（跳过按钮通常更小巧）
-        val sortedCandidates = candidates.sortedWith(
-            compareByDescending<Candidate> { it.score }.thenBy { it.area }
+        // 排序：优先级从高到低，同优先级的从右上到左下
+        candidates.sortWith(
+            compareByDescending<Candidate> { it.priority }
+                .thenBy { it.rect.top }
+                .thenByDescending { it.rect.right }
         )
 
-        // 点多个候选（去重：中心点落入已点区域则跳过），上限 MAX_CLICKS_PER_SCAN
-        var clickedCount = 0
-        val clickedRects = mutableListOf<Rect>()
-        for (candidate in sortedCandidates) {
-            if (clickedCount >= MAX_CLICKS_PER_SCAN) break
+        var closedCount = 0
+        val closedRects = mutableListOf<Rect>()
 
-            val r = Rect()
-            candidate.node.getBoundsInScreen(r)
-            // 去重：中心点落在已点击过的按钮区域内 → 同一个按钮的不同节点表示
-            val cx = r.exactCenterX()
-            val cy = r.exactCenterY()
-            val dup = clickedRects.any { cr ->
-                cx >= cr.left && cx <= cr.right && cy >= cr.top && cy <= cr.bottom
+        for (candidate in candidates) {
+            if (closedCount >= MAX_CLICKS_PER_SCAN) break
+            if (isInCooldown(pkg)) break
+
+            // 去重：中心点落入已关闭区域则跳过
+            val cx = candidate.rect.exactCenterX()
+            val cy = candidate.rect.exactCenterY()
+            if (closedRects.any { cr ->
+                    cx in cr.left..cr.right && cy in cr.top..cr.bottom
+                }) continue
+
+            // ---- 第 4 条：重新取根节点，绝不复用旧节点/旧坐标 ----
+            val freshRoot = try { rootInActiveWindow } catch (_: Exception) { null } ?: break
+            val freshPkg = freshRoot.packageName?.toString()
+            if (freshPkg != null && freshPkg != pkg) {
+                freshRoot.recycle()
+                break
             }
-            if (dup) continue
 
-            if (performClick(candidate, pkg)) {
-                clickedCount++
-                clickedRects.add(r)
-                lastSkipTime = System.currentTimeMillis()
-                if (pkg == lastSkippedPkg) samePkgSkipCount++ else {
-                    samePkgSkipCount = 1
-                    lastSkippedPkg = pkg
-                }
-                DebugLogger.log(this, "✅ 点击成功 $pkg label=${labelOf(candidate.node)}")
-            } else {
-                DebugLogger.log(this, "❌ 点击失败 $pkg label=${labelOf(candidate.node)}")
+            // ---- 第 4 条：检查目标区域附近有没有危险文字 ----
+            if (hasNearbyDangerText(freshRoot, candidate.rect)) {
+                DebugLogger.log(this,
+                    "⛔ 附近有危险文字，跳过 label=${labelOf(candidate.clickNode)}")
+                freshRoot.recycle()
+                try { candidate.clickNode.recycle() } catch (_: Exception) {}
+                continue
             }
-        }
+            freshRoot.recycle()
 
-        // 回收所有候选节点
-        for (c in candidates) c.node.recycle()
-    }
-
-    /**
-     * 取节点文本（调试用）
-     */
-    private fun labelOf(node: AccessibilityNodeInfo): String {
-        return try {
-            val t = node.text?.toString()?.trim().orEmpty()
-            val d = node.contentDescription?.toString()?.trim().orEmpty()
-            (if (t.isNotEmpty()) t else d).replace("\n", " ")
-        } catch (_: Exception) {
-            "?"
-        }
-    }
-
-    /**
-     * 调试用：dump 页面里含"跳/关/广告/×"等关键词的节点，以及
-     * 没有文字但可点击的小节点（可能是无描述的 × 图片按钮）
-     * 用于诊断"为什么这个广告没被识别"
-     */
-    private fun dumpKeywordNodes(root: AccessibilityNodeInfo, pkg: String) {
-        val keywords = listOf("跳", "关", "×", "x", "X", "广告", "ad", "skip", "close")
-        val stack = ArrayDeque<AccessibilityNodeInfo>()
-        stack.addLast(root)
-        var visited = 0
-        var dumped = 0
-        var emptyDumped = 0
-        val density = resources.displayMetrics.density
-        DebugLogger.log(this, "  未找到候选，页面关键词节点：")
-
-        while (stack.isNotEmpty() && visited < MAX_NODES) {
-            val node = stack.removeLast()
-            visited++
+            // 重新取候选节点的 bounds（旧坐标可能已失效）
+            val freshRect = Rect()
             try {
-                val label = labelOf(node)
-                if (label.length in 1..30) {
-                    for (k in keywords) {
-                        if (label.contains(k, ignoreCase = true) && dumped < 15) {
-                            val r = Rect()
-                            node.getBoundsInScreen(r)
-                            DebugLogger.log(
-                                this,
-                                "    「$label」clickable=${node.isClickable} " +
-                                "visible=${node.isVisibleToUser} " +
-                                "bounds=${r.width()}x${r.height()} " +
-                                "class=${node.className?.toString()?.substringAfterLast('.')}"
-                            )
-                            dumped++
-                            break
-                        }
-                    }
-                } else if (node.isClickable && emptyDumped < 10) {
-                    // 无文字但可点击的小节点（可能是没有描述的 ×）
-                    val r = Rect()
-                    node.getBoundsInScreen(r)
-                    val wDp = r.width() / density
-                    val hDp = r.height() / density
-                    if (wDp in 15f..140f && hDp in 15f..140f) {
-                        DebugLogger.log(
-                            this,
-                            "    [无文字]clickable bounds=${r.width()}x${r.height()} " +
-                            "pos=(${r.left},${r.top}) class=${node.className?.toString()?.substringAfterLast('.')}"
-                        )
-                        emptyDumped++
-                    }
-                }
-                for (i in 0 until node.childCount) {
-                    val child = node.getChild(i) ?: continue
-                    stack.addLast(child)
-                }
+                candidate.clickNode.getBoundsInScreen(freshRect)
             } catch (_: Exception) {
+                try { candidate.clickNode.recycle() } catch (_: Exception) {}
+                continue
             }
+            if (freshRect.width() <= 0 || freshRect.height() <= 0) {
+                try { candidate.clickNode.recycle() } catch (_: Exception) {}
+                continue
+            }
+
+            // 执行关闭
+            val ok = performCloseAction(candidate.clickNode, pkg, freshRect)
+            try { candidate.clickNode.recycle() } catch (_: Exception) {}
+
+            if (ok) {
+                closedCount++
+                closedRects.add(freshRect)
+                recordAction(pkg)
+
+                // ---- 第 5 条：关一个就 break，让下次事件/重扫处理剩余广告 ----
+                break
+            }
+        }
+
+        // 回收本轮未处理的候选
+        for (c in candidates) {
+            try { c.clickNode.recycle() } catch (_: Exception) {}
         }
     }
 
-    // ========================================================================
-    // 候选收集
-    // ========================================================================
-
     /**
-     * 广度遍历整棵节点树，收集所有疑似跳过按钮
-     * 关键：文本节点本身不可点击时，向上找可点击父容器或降级为坐标点击
+     * 收集所有关闭候选（DFS 遍历整棵节点树）
      */
     private fun collectCandidates(root: AccessibilityNodeInfo): List<Candidate> {
-        val result = ArrayList<Candidate>()
-        // 按点击目标身份去重（多个文字节点可能指向同一个父容器）
-        val seenTargets = Collections.newSetFromMap(
-            IdentityHashMap<AccessibilityNodeInfo, Boolean>()
-        )
+        val result = mutableListOf<Candidate>()
+        val density = resources.displayMetrics.density
         val stack = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
         stack.addLast(root to 0)
         var visited = 0
@@ -386,39 +370,100 @@ class AdSkipService : AccessibilityService() {
 
             try {
                 if (depth <= MAX_DEPTH) {
-                    val candidate = evaluateNode(node)
-                    if (candidate != null && seenTargets.add(candidate.node)) {
+                    val candidate = evaluateNode(node, density)
+                    if (candidate != null) {
                         result.add(candidate)
                     }
                 }
-
                 if (depth < MAX_DEPTH) {
-                    for (i in 0 until node.childCount) {
-                        val child = node.getChild(i) ?: continue
-                        stack.addLast(child to (depth + 1))
+                    for (i in (0 until node.childCount).reversed()) {
+                        node.getChild(i)?.let { stack.addLast(it to depth + 1) }
                     }
                 }
             } catch (_: Exception) {
-                // 节点在遍历过程中失效（页面跳转/刷新），跳过即可
+                // 节点遍历中失效 → 跳过
             }
         }
         return result
     }
 
     /**
-     * 评估节点并给出点击计划
+     * 评估节点优先级（第 2 条：认控件不认字）
      *
-     * 广告跳过按钮的真实结构往往是：
-     *   FrameLayout(可点击) > 背景图 + TextView("跳过 4")(不可点击)
-     * 或 WebView 里 JS 绑定的 div（无障碍认为不可点击）
-     * 所以：文本匹配后用「可点击祖先」或「坐标手势」来真正点下去
+     * Priority 1000 = 包名命中 AD_SDK_PACKAGES + viewId 命中 CLOSE_VIEW_ID_PATTERNS
+     *         800  = 仅包名命中
+     *         600  = 仅 viewId 命中
+     *         300  = 文字兜底（跳过/关闭/×）
      */
-    private fun evaluateNode(node: AccessibilityNodeInfo): Candidate? {
-        // 1. 文本/位置评分（用节点自身 bounds 做尺寸检查）
-        val score = scoreNode(node)
-        if (score < MIN_SCORE_TO_CLICK) return null
+    private fun evaluateNode(node: AccessibilityNodeInfo, density: Float): Candidate? {
+        if (!node.isVisibleToUser) return null
 
-        // 2. 确定点击目标
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        if (rect.width() <= 0 || rect.height() <= 0) return null
+
+        val wDp = rect.width() / density
+        val hDp = rect.height() / density
+
+        // ---- 尺寸硬约束 ----
+        if (wDp < MIN_WIDTH_DP || hDp < MIN_HEIGHT_DP) return null
+        if (wDp > MAX_WIDTH_DP || hDp > MAX_HEIGHT_DP) return null
+
+        // ---- 排除非按钮控件 ----
+        val className = node.className?.toString() ?: ""
+        if (className.contains("EditText") || className.contains("SeekBar") ||
+            className.contains("ProgressBar") || className.contains("Switch") ||
+            className.contains("ScrollView") || className.contains("RecyclerView") ||
+            className.contains("ListView")) return null
+
+        val pkg = node.packageName?.toString() ?: ""
+        val viewId = node.viewIdResourceName ?: ""
+        val text = node.text?.toString()?.trim() ?: ""
+        val cd = node.contentDescription?.toString()?.trim() ?: ""
+
+        // ---- 第 4 条：危险文字直接拉黑 ----
+        for (danger in DANGEROUS_TEXTS) {
+            if (text.contains(danger, ignoreCase = true) ||
+                cd.contains(danger, ignoreCase = true)) return null
+        }
+
+        // ---- 排除功能按钮 ----
+        for (exclude in SKIP_EXCLUDE_WORDS) {
+            if (text.contains(exclude, ignoreCase = true)) return null
+        }
+
+        // ---- 长文案 = 广告主体 ----
+        if (text.length > 24 && cd.length > 24) return null
+
+        // ============ 优先级判定 ============
+        var priority = 0
+
+        val pkgHit = AD_SDK_PACKAGES.any { pkg.startsWith(it) }
+        val viewIdHit = CLOSE_VIEW_ID_PATTERNS.any { pat ->
+            viewId.contains(pat, ignoreCase = true)
+        }
+
+        if (pkgHit && viewIdHit) {
+            priority = PRIORITY_PKG_VIEWID   // 1000 双重命中
+        } else if (pkgHit) {
+            priority = PRIORITY_PKG           // 800  仅包名
+        } else if (viewIdHit) {
+            priority = PRIORITY_VIEWID        // 600  仅 viewId
+        } else {
+            // ---- 文字兜底（最低优先级 300） ----
+            val label = text.ifEmpty { cd }
+            if (label.isEmpty()) return null
+
+            val textHit = SKIP_TEXTS.any {
+                label.equals(it, ignoreCase = true) ||
+                (label.length <= 12 && label.contains(it, ignoreCase = true))
+            } || CLOSE_SYMBOLS.contains(label)
+
+            if (!textHit) return null
+            priority = PRIORITY_TEXT
+        }
+
+        // ============ 确定点击目标 ============
         var clickNode = node
         var gestureOnly = false
 
@@ -427,30 +472,26 @@ class AdSkipService : AccessibilityService() {
             if (ancestor != null) {
                 val aRect = Rect()
                 ancestor.getBoundsInScreen(aRect)
-                val density = resources.displayMetrics.density
                 val aW = aRect.width() / density
                 val aH = aRect.height() / density
-                // 祖先尺寸合理（就是按钮大小）→ 直接点祖先
                 if (aW in MIN_WIDTH_DP..MAX_WIDTH_DP && aH in MIN_HEIGHT_DP..MAX_HEIGHT_DP) {
                     clickNode = ancestor
                 } else {
-                    // 祖先太大（整个广告卡片）→ 不点大卡片，改为对文字节点坐标做手势点击
                     gestureOnly = true
                 }
             } else {
-                // 没有可点击祖先 → 坐标手势点击
                 gestureOnly = true
             }
         }
 
-        val rect = Rect()
-        clickNode.getBoundsInScreen(rect)
-        if (rect.width() <= 0 || rect.height() <= 0) return null
+        val finalRect = Rect()
+        clickNode.getBoundsInScreen(finalRect)
+        if (finalRect.width() <= 0 || finalRect.height() <= 0) return null
 
         return Candidate(
-            node = clickNode,
-            score = score,
-            area = rect.width() * rect.height(),
+            priority = priority,
+            rect = finalRect,
+            clickNode = clickNode,
             gestureOnly = gestureOnly
         )
     }
@@ -459,8 +500,7 @@ class AdSkipService : AccessibilityService() {
      * 向上找最近的可点击祖先
      */
     private fun findClickableAncestor(
-        node: AccessibilityNodeInfo,
-        maxDepth: Int
+        node: AccessibilityNodeInfo, maxDepth: Int
     ): AccessibilityNodeInfo? {
         var current = node.parent
         var depth = 0
@@ -473,350 +513,108 @@ class AdSkipService : AccessibilityService() {
     }
 
     // ========================================================================
-    // 节点评分（核心）
+    // 第 3 条：防连环
     // ========================================================================
 
     /**
-     * 给一个节点打分（只看文本和尺寸，不要求节点可点击）：
-     *   100 = 强关键词精确匹配 / 倒计时格式
-     *   85  = × 符号 + 小尺寸
-     *   80  = 弱关键词 + 广告上下文
-     *   70  = 弱关键词 + 屏幕边缘位置
-     *   0   = 不是跳过按钮
+     * 记录一次关闭动作，检测是否需要触发冷却
      */
-    private fun scoreNode(node: AccessibilityNodeInfo): Int {
-        if (!node.isVisibleToUser) return 0
+    private fun recordAction(pkg: String) {
+        val now = System.currentTimeMillis()
+        val list = pkgActionTimestamps.getOrPut(pkg) { mutableListOf() }
+        list.add(now)
+        list.removeAll { now - it > CHAIN_WINDOW_MS }
 
-        val rect = Rect()
-        node.getBoundsInScreen(rect)
-        if (rect.width() <= 0 || rect.height() <= 0) return 0
-
-        val density = resources.displayMetrics.density
-        val wDp = rect.width() / density
-        val hDp = rect.height() / density
-
-        // ====== 尺寸硬约束（防误点广告主体） ======
-        // 跳过按钮绝不会太大：广告图片/视频/卡片都会被这里拦下
-        if (wDp < MIN_WIDTH_DP || hDp < MIN_HEIGHT_DP) return 0
-        if (wDp > MAX_WIDTH_DP || hDp > MAX_HEIGHT_DP) return 0
-
-        // ====== 排除明显不是按钮的控件 ======
-        val className = node.className?.toString() ?: ""
-        if (className.contains("EditText") ||
-            className.contains("SeekBar") ||
-            className.contains("ProgressBar") ||
-            className.contains("Switch") ||
-            className.contains("ScrollView") ||
-            className.contains("RecyclerView") ||
-            className.contains("ListView")) {
-            return 0
+        if (list.size >= CHAIN_THRESHOLD) {
+            globalCooldownUntil = now + COOLDOWN_MS
+            pkgActionTimestamps.clear()
+            DebugLogger.log(this, "🧊 防连环冷却 ${COOLDOWN_MS}ms（${pkg} ${CHAIN_THRESHOLD}次/${CHAIN_WINDOW_MS}ms）")
         }
+    }
 
-        val text = node.text?.toString()?.trim() ?: ""
-        val cd = node.contentDescription?.toString()?.trim() ?: ""
-        val label = if (text.isNotEmpty()) text else cd
-
-        if (label.isEmpty()) return 0
-
-        // ====== 黑名单：广告标签（点了会跳转！） ======
-        if (AD_LABELS.contains(label)) return 0
-        // 单独的 "广告" 变体（如 "广告 ×" 已在上方精确匹配处理）
-        val labelNoSpace = label.replace(" ", "")
-        if (AD_LABELS.contains(labelNoSpace)) return 0
-
-        // ====== 长文案 = 广告主体，绝不点 ======
-        if (label.length > 24) return 0
-        for (promo in PROMO_WORDS) {
-            if (label.contains(promo, ignoreCase = true)) return 0
+    /**
+     * 当前是否在冷却期
+     */
+    private fun isInCooldown(pkg: String): Boolean {
+        if (System.currentTimeMillis() < globalCooldownUntil) {
+            return true
         }
-        // ====== 正常功能按钮（跳过教程等）排除 ======
-        for (exclude in SKIP_EXCLUDE_WORDS) {
-            if (label.contains(exclude, ignoreCase = true)) return 0
+        // 冷却期结束，清理
+        if (globalCooldownUntil > 0L) {
+            globalCooldownUntil = 0L
+            pkgActionTimestamps.clear()
         }
-
-        // ====== 1. 强关键词 ======
-        for (k in STRONG_KEYWORDS) {
-            if (label.equals(k, ignoreCase = true)) return 100
-            if (label.length <= 12 && label.contains(k, ignoreCase = true)) return 100
-        }
-        // 内容描述里的强关键词
-        if (cd.isNotEmpty()) {
-            for (k in STRONG_KEYWORDS) {
-                if (cd.equals(k, ignoreCase = true)) return 100
-                if (cd.length <= 12 && cd.contains(k, ignoreCase = true)) return 95
-            }
-        }
-
-        // ====== 2. 倒计时格式（视频/开屏广告） ======
-        if (RE_COUNTDOWN_AFTER.matches(label)) return 100
-        if (RE_COUNTDOWN_BEFORE.matches(label)) return 100
-        if (RE_COUNTDOWN_LOOSE.containsMatchIn(label)) return 95
-
-        // ====== 3. 关闭符号 × ======
-        if (CLOSE_SYMBOLS.contains(label)) {
-            if (wDp > 120 || hDp > 120) return 0
-            // 有广告上下文 → 高置信度
-            if (hasAdContext(node)) return 85
-            // 位于屏幕边缘/角落 → 悬浮广告/卡片 × 常见位置
-            if (isEdgeClosePosition(rect)) return 75
-            // 位于某个对话框/卡片的右上角 → 弹窗广告的 ×（含白底白×）
-            if (isCardCorner(node, rect)) return 73
-            // 屏幕底部 + 页面有广告披露标签 → 全屏广告的圆形 ×
-            if (bottomAdDisclosure && isBottomArea(rect)) return 72
-            return 0
-        }
-
-        // ====== 3.5 内容描述为"关闭"的小按钮（信息流广告卡片 × 常无文字只有描述） ======
-        if ((cd.equals("关闭", ignoreCase = true) || cd.equals("close", ignoreCase = true)) &&
-            wDp <= 100 && hDp <= 100
-        ) {
-            if (hasAdContext(node)) return 80
-            if (isCorner(rect)) return 72
-            if (isCardCorner(node, rect)) return 72
-            return 0
-        }
-
-        // ====== 3.6 文字为"关闭"的小按钮（弹窗/悬浮广告常见，但需严格限制） ======
-        if (label.equals("关闭", ignoreCase = true) || label.equals("close", ignoreCase = true)) {
-            if (wDp > 120 || hDp > 100) return 0
-            if (hasAdContext(node)) return 80
-            if (isCorner(rect)) return 72
-            if (isCardCorner(node, rect)) return 72
-            return 0  // 不在顶部角落/卡片角落 + 无广告上下文 → 不点（防误关下载/通知）
-        }
-
-        // ====== 4. 弱关键词（跳过/skip）需上下文 ======
-        var matchedWeak = false
-        for (k in WEAK_KEYWORDS) {
-            if (label.equals(k, ignoreCase = true)) { matchedWeak = true; break }
-            if (label.length <= 8 && label.contains(k, ignoreCase = true)) { matchedWeak = true; break }
-        }
-        if (matchedWeak) {
-            if (hasAdContext(node)) return 85
-            if (isEdgeClosePosition(rect)) return 70
-            return 0 // 无佐证 → 不点
-        }
-
-        // ====== 5. 弹窗广告按钮 ======
-        for (k in DIALOG_KEYWORDS) {
-            if (label.equals(k, ignoreCase = true) && wDp <= 260) {
-                return if (hasAdContext(node)) 80 else 0
-            }
-        }
-
-        return 0
+        return false
     }
 
     // ========================================================================
-    // 辅助判断
+    // 第 4 条：防误点
     // ========================================================================
 
     /**
-     * 检查节点附近是否有"广告"上下文
-     * 只看父节点的直接子节点 + 节点自身，避免遍历过深误判
+     * 在新鲜根节点上检查目标区域附近（60px 范围）是否有危险文字
      */
-    private fun hasAdContext(node: AccessibilityNodeInfo): Boolean {
-        val ownText = (node.text?.toString() ?: "") + " " + (node.contentDescription?.toString() ?: "")
-        for (adWord in AD_CONTEXT_WORDS) {
-            if (ownText.contains(adWord, ignoreCase = true)) return true
-        }
-
-        // 逐级向上检查祖先的兄弟节点（最多 3 层），
-        // 避免因视图层级嵌套过深导致广告上下文漏检
-        var ancestor = node.parent
-        var level = 0
-        while (ancestor != null && level < 3) {
-            if (checkSiblingsForAdContext(ancestor)) return true
-            ancestor = ancestor.parent
-            level++
-        }
-        return false
-    }
-
-    /**
-     * 检查某个节点的所有直接子节点是否包含广告上下文词
-     */
-    private fun checkSiblingsForAdContext(parent: AccessibilityNodeInfo): Boolean {
-        try {
-            for (i in 0 until parent.childCount) {
-                val sibling = parent.getChild(i) ?: continue
-                val sibText = (sibling.text?.toString() ?: "") + " " +
-                              (sibling.contentDescription?.toString() ?: "")
-                for (adWord in AD_CONTEXT_WORDS) {
-                    if (sibText.contains(adWord, ignoreCase = true)) {
-                        sibling.recycle()
-                        return true
-                    }
-                }
-                sibling.recycle()
-            }
-        } catch (_: Exception) {
-            // 忽略节点已失效的异常
-        }
-        return false
-    }
-
-    /**
-     * 是否位于屏幕左上/右上角区域（开屏广告跳过按钮的典型位置）
-     */
-    private fun isCorner(rect: Rect): Boolean {
-        val dm = resources.displayMetrics
-        val inTopBand = rect.top < dm.heightPixels * 0.35f
-        val inLeftHalf = rect.right < dm.widthPixels * 0.55f
-        val inRightHalf = rect.left > dm.widthPixels * 0.45f
-        return inTopBand && (inLeftHalf || inRightHalf)
-    }
-
-    /**
-     * 是否位于「关闭按钮常见位置」：
-     *   1. 顶部左右角落（开屏广告的跳过按钮）
-     *   2. 屏幕左右边缘、上 70% 区域（信息流广告卡片的 × 可能在页面中部）
-     * 排除底部 20% 区域，避免误点浏览器下载进度条的关闭按钮
-     */
-    private fun isEdgeClosePosition(rect: Rect): Boolean {
-        val dm = resources.displayMetrics
-        val w = dm.widthPixels
-        val h = dm.heightPixels
-
-        // 顶部角落
-        if (isCorner(rect)) return true
-
-        // 底部 20% 区域排除（下载通知/底部导航按钮）
-        if (rect.top > h * 0.8f) return false
-
-        // 右侧边缘（上 70% 区域）：信息流广告卡片 ×
-        if (rect.left > w * 0.65f && rect.top < h * 0.7f) return true
-
-        // 左侧边缘（上 70% 区域）
-        if (rect.right < w * 0.35f && rect.top < h * 0.7f) return true
-
-        return false
-    }
-
-    /**
-     * 是否位于某个「对话框 / 卡片」的左上或右上角
-     * （弹窗广告的 ×，包括白底白 × 这种看不见但存在的关闭按钮）
-     * 判断：向上找 4 层祖先，若有足够大的祖先（像对话框），
-     *       且按钮贴在该祖先的顶部左/右边缘附近 → 是卡片角落关闭按钮
-     */
-    private fun isCardCorner(node: AccessibilityNodeInfo, rect: Rect): Boolean {
-        val dm = resources.displayMetrics
-        val w = dm.widthPixels
-        val h = dm.heightPixels
-        var current = node.parent
-        var depth = 0
-        while (current != null && depth < 4) {
-            try {
-                val pr = Rect()
-                current.getBoundsInScreen(pr)
-                // 祖先足够大（像一个弹窗/卡片）
-                if (pr.width() > w * 0.4f && pr.height() > h * 0.15f) {
-                    val nearRight = rect.left > pr.right - pr.width() * 0.18f
-                    val nearLeft = rect.right < pr.left + pr.width() * 0.18f
-                    val nearTop = rect.top < pr.top + pr.height() * 0.20f
-                    if ((nearRight || nearLeft) && nearTop) {
-                        return true
-                    }
-                }
-            } catch (_: Exception) {
-            }
-            current = current.parent
-            depth++
-        }
-        return false
-    }
-
-    /**
-     * 是否位于屏幕底部区域（全屏广告的圆形 × 常在底部）
-     */
-    private fun isBottomArea(rect: Rect): Boolean {
-        val h = resources.displayMetrics.heightPixels
-        return rect.top > h * 0.72f
-    }
-
-    /**
-     * 探测当前页面底部是否有「广告」披露标签
-     * （OPPO/穿山甲等 SDK 会在全屏广告底部放一个小的"广告"标识）
-     * 有的话才允许点击底部区域的 ×，避免误关浏览器下载进度
-     */
-    private fun detectBottomAdDisclosure(root: AccessibilityNodeInfo) {
-        bottomAdDisclosure = false
-        val dm = resources.displayMetrics
-        val h = dm.heightPixels
+    private fun hasNearbyDangerText(root: AccessibilityNodeInfo, targetRect: Rect): Boolean {
         val stack = ArrayDeque<AccessibilityNodeInfo>()
         stack.addLast(root)
         var visited = 0
-        while (stack.isNotEmpty() && visited < 500) {
+        while (stack.isNotEmpty() && visited < 300) {
             val node = stack.removeLast()
             visited++
             try {
-                val t = node.text?.toString()?.trim().orEmpty()
-                val d = node.contentDescription?.toString()?.trim().orEmpty()
-                val isAdLabel = t == "广告" || t == "廣告" || t == "AD" || t == "Ad" || t == "ad" ||
-                                d == "广告" || d == "廣告" || d == "AD" || d == "Ad" || d == "ad"
-                if (isAdLabel) {
-                    val r = Rect()
-                    node.getBoundsInScreen(r)
-                    if (r.top > h * 0.7f) {
-                        bottomAdDisclosure = true
-                        return
+                val text = node.text?.toString()?.trim() ?: ""
+                val cd = node.contentDescription?.toString()?.trim() ?: ""
+                for (danger in DANGEROUS_TEXTS) {
+                    if ((text.contains(danger, ignoreCase = true) ||
+                         cd.contains(danger, ignoreCase = true)) && text.length <= 24
+                    ) {
+                        val r = Rect()
+                        node.getBoundsInScreen(r)
+                        if (isNearby(r, targetRect)) return true
+                        // 危险文本在目标区域内 → 就是广告主体 → 拉黑
+                        if (r.intersect(targetRect)) return true
                     }
                 }
                 for (i in 0 until node.childCount) {
-                    val child = node.getChild(i) ?: continue
-                    stack.addLast(child)
+                    node.getChild(i)?.let { stack.addLast(it) }
                 }
             } catch (_: Exception) {
             }
-        }
-    }
-
-    private fun isSystemPackage(pkg: String): Boolean {
-        if (pkg in SYSTEM_PACKAGES_EXACT) return true
-        for (prefix in SYSTEM_PACKAGES_PREFIX) {
-            if (pkg.startsWith(prefix)) return true
         }
         return false
     }
 
+    /**
+     * 两个矩形是否在 60px 范围内
+     */
+    private fun isNearby(a: Rect, b: Rect): Boolean {
+        val gap = 60
+        return (a.left - b.right) < gap && (b.left - a.right) < gap &&
+               (a.top - b.bottom) < gap && (b.top - a.bottom) < gap
+    }
+
     // ========================================================================
-    // 点击 & 通知
+    // 执行关闭
     // ========================================================================
 
     /**
-     * 执行点击：先试无障碍 ACTION_CLICK，失败则用坐标手势点击
-     * （WebView 广告、自定义 View 的点击事件往往不响应 ACTION_CLICK）
+     * 执行关闭动作：先尝试无障碍 ACTION_CLICK，失败则用坐标手势兜底
      */
-    private fun performClick(candidate: Candidate, pkg: String): Boolean {
-        var clicked = false
-
-        // 1. 优先无障碍点击（gestureOnly=false 时）
-        if (!candidate.gestureOnly) {
-            clicked = try {
-                candidate.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            } catch (_: Exception) {
-                false
-            }
+    private fun performCloseAction(node: AccessibilityNodeInfo, pkg: String, rect: Rect): Boolean {
+        var ok = try {
+            node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        } catch (_: Exception) {
+            false
         }
-
-        // 2. 兜底：坐标手势点击
-        if (!clicked) {
-            val rect = Rect()
-            try {
-                candidate.node.getBoundsInScreen(rect)
-            } catch (_: Exception) {
-                return false
-            }
-            if (rect.width() > 0 && rect.height() > 0) {
-                clicked = clickByGesture(rect.exactCenterX(), rect.exactCenterY())
-            }
+        if (!ok && rect.width() > 0 && rect.height() > 0) {
+            ok = clickByGesture(rect.exactCenterX(), rect.exactCenterY())
         }
-
-        if (clicked) {
+        if (ok) {
             AdStatsManager.recordSkip(this, pkg)
-            showSkipNotification(pkg)
+            showSkipNotification(pkg, "控件")
+            DebugLogger.log(this, "✅ 控件关闭 $pkg rect=${rect.width()}x${rect.height()}")
         }
-        return clicked
+        return ok
     }
 
     /**
@@ -836,7 +634,11 @@ class AdSkipService : AccessibilityService() {
         }
     }
 
-    private fun showSkipNotification(pkg: String) {
+    // ========================================================================
+    // 通知 & 工具方法
+    // ========================================================================
+
+    private fun showSkipNotification(pkg: String, method: String) {
         val appName = try {
             val appInfo = packageManager.getApplicationInfo(pkg, 0)
             packageManager.getApplicationLabel(appInfo).toString()
@@ -845,9 +647,11 @@ class AdSkipService : AccessibilityService() {
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val notification = android.app.Notification.Builder(this, NoAdApp.CHANNEL_SKIP_REPORT)
+            val notification = android.app.Notification.Builder(
+                this, NoAdApp.CHANNEL_SKIP_REPORT
+            )
                 .setContentTitle("🐟 已跳过广告")
-                .setContentText("来自 $appName")
+                .setContentText("来自 $appName · $method")
                 .setSmallIcon(android.R.drawable.ic_menu_close_clear_cancel)
                 .setAutoCancel(true)
                 .setOngoing(false)
@@ -858,14 +662,65 @@ class AdSkipService : AccessibilityService() {
                 val nm = getSystemService(NotificationManager::class.java)
                 nm.notify(System.currentTimeMillis().hashCode(), notification)
             } catch (_: Exception) {
-                // 通知权限被拒时忽略
             }
         }
     }
 
-    // ========================================================================
-    // 生命周期
-    // ========================================================================
+    private fun labelOf(node: AccessibilityNodeInfo): String = try {
+        val t = node.text?.toString()?.trim().orEmpty()
+        val d = node.contentDescription?.toString()?.trim().orEmpty()
+        (if (t.isNotEmpty()) t else d).replace("\n", " ")
+    } catch (_: Exception) {
+        "?"
+    }
+
+    private fun isSystemPackage(pkg: String): Boolean {
+        if (pkg in SYSTEM_PACKAGES_EXACT) return true
+        for (prefix in SYSTEM_PACKAGES_PREFIX) {
+            if (pkg.startsWith(prefix)) return true
+        }
+        return false
+    }
+
+    /**
+     * 调试 dump：输出页面中含关闭关键词的节点
+     */
+    private fun dumpKeywordNodes(root: AccessibilityNodeInfo, pkg: String) {
+        val keywords = listOf("跳", "关", "×", "x", "X", "广告", "ad", "skip", "close")
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.addLast(root)
+        var visited = 0
+        var dumped = 0
+        DebugLogger.log(this, "  未找到候选，页面关键词节点：")
+        while (stack.isNotEmpty() && visited < MAX_NODES && dumped < 15) {
+            val node = stack.removeLast()
+            visited++
+            try {
+                val label = labelOf(node)
+                if (label.length in 1..30) {
+                    for (k in keywords) {
+                        if (label.contains(k, ignoreCase = true)) {
+                            val r = Rect()
+                            node.getBoundsInScreen(r)
+                            DebugLogger.log(
+                                this,
+                                "    「$label」clickable=${node.isClickable} " +
+                                "bounds=${r.width()}x${r.height()} " +
+                                "class=${node.className?.toString()?.substringAfterLast('.')} " +
+                                "viewId=${node.viewIdResourceName}"
+                            )
+                            dumped++
+                            break
+                        }
+                    }
+                }
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { stack.addLast(it) }
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
 
     override fun onInterrupt() {
         handler.removeCallbacksAndMessages(null)
@@ -881,10 +736,9 @@ class AdSkipService : AccessibilityService() {
     // ========================================================================
 
     private data class Candidate(
-        val node: AccessibilityNodeInfo,
-        val score: Int,
-        val area: Int,
-        /** true = 直接坐标手势点击（节点不可点击且祖先太大/不存在） */
-        val gestureOnly: Boolean = false
+        val priority: Int,                     // 优先级（1000 > 800 > 600 > 300）
+        val rect: Rect,                        // 按钮在屏幕上的 bounds
+        val clickNode: AccessibilityNodeInfo,  // 实际要点的节点
+        val gestureOnly: Boolean = false       // 仅手势坐标点击（节点不可点击）
     )
 }
