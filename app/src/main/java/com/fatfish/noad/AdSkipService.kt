@@ -80,6 +80,7 @@ class AdSkipService : AccessibilityService() {
         // 广告上下文词（用于佐证弱关键词）
         private val AD_CONTEXT_WORDS = listOf(
             "广告", "廣告", "推广", "sponsored", "ad",
+            "悬浮", "悬浮球", "浮窗",  // 悬浮广告条特征（运动校园等 App 常见）
         )
 
         // 促销文案特征词（大段文案 = 广告主体，不点）
@@ -347,17 +348,28 @@ class AdSkipService : AccessibilityService() {
         // ====== 3. 关闭符号 × ======
         if (CLOSE_SYMBOLS.contains(label)) {
             if (wDp > 120 || hDp > 120) return 0
-            // 只在明确广告上下文（附近有"广告"标签）时点击
-            // 防止流氓 App 的假 × 把用户带去落地页
-            return if (hasAdContext(node)) 85 else 0
+            // 有广告上下文 → 高置信度
+            if (hasAdContext(node)) return 85
+            // 无上下文但在屏幕角落 → 悬浮广告/卡片 × 常见位置，中等置信度
+            if (isCorner(rect)) return 75
+            return 0
         }
 
         // ====== 3.5 内容描述为"关闭"的小按钮（信息流广告卡片 × 常无文字只有描述） ======
-        // 必须配合广告上下文，避免误关正常弹窗/下载进度
         if ((cd.equals("关闭", ignoreCase = true) || cd.equals("close", ignoreCase = true)) &&
             wDp <= 100 && hDp <= 100
         ) {
-            return if (hasAdContext(node)) 80 else 0
+            if (hasAdContext(node)) return 80
+            if (isCorner(rect)) return 72
+            return 0
+        }
+
+        // ====== 3.6 文字为"关闭"的小按钮（弹窗/悬浮广告常见，但需严格限制） ======
+        if (label.equals("关闭", ignoreCase = true) || label.equals("close", ignoreCase = true)) {
+            if (wDp > 120 || hDp > 100) return 0
+            if (hasAdContext(node)) return 80
+            if (isCorner(rect)) return 72
+            return 0  // 不在角落 + 无广告上下文 → 不点（防误关下载/通知）
         }
 
         // ====== 4. 弱关键词（跳过/skip）需上下文 ======
@@ -396,7 +408,21 @@ class AdSkipService : AccessibilityService() {
             if (ownText.contains(adWord, ignoreCase = true)) return true
         }
 
-        val parent = node.parent ?: return false
+        // 检查父节点的兄弟（第一级）
+        val parent = node.parent
+        if (parent != null) {
+            if (checkSiblingsForAdContext(parent)) return true
+            // 检查祖父节点的兄弟（第二级）：悬浮广告条的×和"悬浮球"文案可能隔了两层
+            val grandparent = parent.parent
+            if (grandparent != null && checkSiblingsForAdContext(grandparent)) return true
+        }
+        return false
+    }
+
+    /**
+     * 检查某个节点的所有直接子节点是否包含广告上下文词
+     */
+    private fun checkSiblingsForAdContext(parent: AccessibilityNodeInfo): Boolean {
         try {
             for (i in 0 until parent.childCount) {
                 val sibling = parent.getChild(i) ?: continue
