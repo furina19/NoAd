@@ -35,18 +35,31 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      # 生成固定签名密钥（解决"不能覆盖旧版本"问题）
+      - name: 🔑 生成固定签名密钥
+        run: |
+          keytool -genkey -v \
+            -keystore noad.keystore \
+            -alias noad \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 30000 \
+            -storepass noad123 \
+            -keypass noad123 \
+            -dname "CN=NoAd, OU=NoAd, O=NoAd, L=Unknown, ST=Unknown, C=CN" \
+            -noprompt
+          echo "✅ 固定签名密钥已生成"
+
       - name: 🛠 设置 Gradle
         uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: 8.5
 
       - name: 🔨 编译 Debug APK
         if: ${{ github.event.inputs.buildType != 'release' }}
-        run: gradle assembleDebug
+        run: ./gradlew assembleDebug
 
-      - name: 🔨 编译 Release APK（未签名）
+      - name: 🔨 编译 Release APK
         if: ${{ github.event.inputs.buildType == 'release' }}
-        run: gradle assembleRelease
+        run: ./gradlew assembleRelease
 
       - name: 📦 上传 APK
         uses: actions/upload-artifact@v4
@@ -64,4 +77,4 @@ jobs:
           echo "|------|------|" >> $GITHUB_STEP_SUMMARY
           find app/build/outputs/apk -name "*.apk" -exec sh -c 'echo "| $(basename {}) | $(du -sh {} | cut -f1) |"' \; >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "⚠️ Debug APK 可直接安装，Release APK 需签名后才能安装。" >> $GITHUB_STEP_SUMMARY
+          echo "🔑 使用固定签名，可直接覆盖安装旧版本（仅限同一来源编译的 APK）" >> $GITHUB_STEP_SUMMARY

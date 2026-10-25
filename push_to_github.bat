@@ -109,6 +109,12 @@ echo   ║  你的仓库 → Actions 标签            ║
 echo   ║  → 点最新运行 → Artifacts           ║
 echo   ║  → 下载 NoAd-APK.zip               ║
 echo   ║                                    ║
+echo   ║  ⚠️  首次安装提示：                 ║
+echo   ║  如果手机上已有桌宠鱼装的旧版本，   ║
+echo   ║  需先卸载旧版再装这个新版！         ║
+echo   ║  之后每次从 GitHub 更新就能直接     ║
+echo   ║  覆盖安装啦～                       ║
+echo   ║                                    ║
 echo   ║  🐟 肥肥的尾巴摇成螺旋桨啦！       ║
 echo   ╚══════════════════════════════════════╝
 echo.

@@ -7,12 +7,27 @@ android {
     namespace = "com.fatfish.noad"
     compileSdk = 34
 
+    // ====== 固定签名：解决不同机器/CI 编译 APK 签名不同导致无法覆盖安装的问题 ======
+    // 如果项目根目录存在 noad.keystore，就用它签名（保证每次编译签名一致）
+    // 如果不存在（本地首次编译），回退到系统默认 debug 签名
+    val keystoreFile = rootProject.file("noad.keystore")
+    signingConfigs {
+        create("fixed") {
+            if (keystoreFile.exists()) {
+                storeFile = keystoreFile
+                storePassword = "noad123"
+                keyAlias = "noad"
+                keyPassword = "noad123"
+            }
+        }
+    }
+
     defaultConfig {
         applicationId = "com.fatfish.noad"
         minSdk = 24
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -25,9 +40,19 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // 固定签名（如果 keystore 存在）
+            val fixed = signingConfigs.findByName("fixed")
+            if (fixed != null && fixed.storeFile?.exists() == true) {
+                signingConfig = fixed
+            }
         }
         debug {
             isMinifyEnabled = false
+            // 固定签名（如果 keystore 存在）
+            val fixed = signingConfigs.findByName("fixed")
+            if (fixed != null && fixed.storeFile?.exists() == true) {
+                signingConfig = fixed
+            }
         }
     }
 
